@@ -1,0 +1,178 @@
+import pandas as pd
+import numpy as np
+import datetime as dt
+import matplotlib.pyplot as plt
+from itertools import combinations
+from datetime import datetime, timedelta
+import yfinance as yf
+
+# Number of pairs in a portfolio during a period
+PORTFOLIO_SIZE = 5
+
+etf_list = ['EWA', 'EWK', 'EWO', 'EWC', 'EWQ', 'EWH', 'EWI', 'EWJ', 'EWM', 'EWW', 'EWN', 'EWS', 'EWP', 'EWD', 'EWL', 'EWY', 'EWU',
+            'EWZ', 'EWT', 'EZU', 'SPY']
+
+historical_data = yf.download(etf_list, start="2007-01-01", end="2024-11-01")
+close_prices =  historical_data['Adj Close']
+
+def normalize(df):
+    return df /df.iloc[0]
+
+def calculate_ssd(df):
+    filtered_df = df.dropna(axis=1)
+    return {f'{c1}-{c2}': np.sum((filtered_df[c1] - df[c2]) ** 2) for c1, c2 in combinations(filtered_df.columns, 2)}
+
+def get_formation_trading_periods(start_date, end_date, formation_period=180, trading_period=20):
+    """Generate formation and trading periods"""
+    current_date = start_date
+    periods = []
+    while current_date < end_date:
+        formation_end = current_date + timedelta(days=formation_period)
+        trading_end = formation_end + timedelta(days=trading_period)
+        periods.append({
+            'formation_start': current_date,
+            'formation_end': formation_end,
+            'trading_start': formation_end,
+            'trading_end': trading_end
+        })
+        current_date = formation_end
+    return periods
+
+def select_pairs(prices_df, formation_start, formation_end):
+    """Select top PORTFOLIO_SIZE pairs with smallest distance"""
+    formation_prices = prices_df.loc[formation_start:formation_end]
+    normalized_prices = normalize(formation_prices)
+    distances = calculate_ssd(normalized_prices)
+    
+    # Sort pairs by distance and select top PORTFOLIO_SIZE
+    sorted_pairs = sorted(distances.items(), key=lambda x: x[1])
+    return [pair[0] for pair in sorted_pairs[:PORTFOLIO_SIZE]]
+
+def calculate_pair_signals(prices_df, pair, trading_start, trading_end, std_multiplier=0.5):
+    """Calculate trading signals for a pair"""
+    pair_prices = prices_df.loc[trading_start:trading_end]
+    etf1, etf2 = pair.split('-')
+    
+    # Normalize prices for the trading period
+    norm_prices = normalize(pair_prices)
+    spread = norm_prices[etf1] - norm_prices[etf2]
+    
+    # Calculate standard deviation from formation period
+    std = spread.std()
+    threshold = std * std_multiplier
+    
+    # Generate signals
+    signals = pd.DataFrame(index=spread.index)
+    signals['spread'] = spread
+    signals['upper_threshold'] = threshold
+    signals['lower_threshold'] = -threshold
+    signals['position'] = 0
+    
+    # Long etf1, short etf2 when spread < -threshold
+    signals.loc[spread < -threshold, 'position'] = 1
+    # Long etf2, short etf1 when spread > threshold
+    signals.loc[spread > threshold, 'position'] = -1
+    
+    return signals
+
+def calculate_pair_returns(prices_df, signals, pair, commission_rate=0.0001):
+    """Calculate returns for a single pair including commission costs"""
+    etf1, etf2 = pair.split('-')
+    
+    # Calculate daily returns
+    returns_etf1 = prices_df[etf1].pct_change()
+    returns_etf2 = prices_df[etf2].pct_change()
+    
+    # Calculate position changes (1 for entry, -1 for exit)
+    position_changes = signals['position'].diff().abs()
+    
+    # Calculate commission costs (both entry and exit, for both legs of the pair)
+    # Multiply by 2 for both legs of the pair (long and short)
+    commission_costs = position_changes * commission_rate * 2
+    
+    # Calculate pair returns (long-short) and subtract commission costs
+    pair_returns = signals['position'].shift(1) * (returns_etf1 - returns_etf2) - commission_costs
+    
+    return pair_returns
+
+def backtest_strategy(prices_df, start_date, end_date):
+    """Run backtest for the pairs trading strategy"""
+    # Get all trading periods
+    periods = get_formation_trading_periods(start_date, end_date)
+    
+    # Store returns for each period
+    all_returns = pd.Series(dtype=float)
+    
+    for period in periods:
+        # Select pairs for this period
+        selected_pairs = select_pairs(prices_df, period['formation_start'], period['formation_end'])
+        period_returns = []
+        
+        # Calculate returns for each pair
+        for pair in selected_pairs:
+            signals = calculate_pair_signals(
+                prices_df, 
+                pair, 
+                period['trading_start'], 
+                period['trading_end']
+            )
+            pair_returns = calculate_pair_returns(
+                prices_df.loc[period['trading_start']:period['trading_end']], 
+                signals, 
+                pair
+            )
+            period_returns.append(pair_returns)
+        
+        # Combine returns for all pairs with equal weighting
+        if period_returns:
+            period_portfolio_returns = sum(period_returns) / len(period_returns)
+            all_returns = pd.concat([all_returns, period_portfolio_returns])
+    
+    return all_returns
+
+def calculate_performance_metrics(returns):
+    """Calculate key performance metrics"""
+    # Annualize assuming 252 trading days
+    annual_return = (1 + returns.mean()) ** 252 - 1
+    annual_volatility = returns.std() * np.sqrt(252)
+    sharpe_ratio = annual_return / annual_volatility if annual_volatility != 0 else 0
+    
+    # Maximum drawdown
+    cum_returns = (1 + returns).cumprod()
+    rolling_max = cum_returns.expanding().max()
+    drawdowns = cum_returns / rolling_max - 1
+    max_drawdown = drawdowns.min()
+    
+    # Cumulative returns
+    total_return = cum_returns.iloc[-1] - 1
+    
+    metrics = {
+        'Annual Return': annual_return,
+        'Annual Volatility': annual_volatility,
+        'Sharpe Ratio': sharpe_ratio,
+        'Maximum Drawdown': max_drawdown,
+        'Total Return': total_return
+    }
+    
+    return metrics
+
+# Run backtest with commissions
+start_date = datetime(2007, 1, 1)
+end_date = datetime(2024, 1, 1)
+strategy_returns = backtest_strategy(close_prices, start_date, end_date)
+
+# Calculate and display performance metrics
+metrics = calculate_performance_metrics(strategy_returns)
+print("\nPerformance Metrics (including 0.01% commission per trade):")
+for metric, value in metrics.items():
+    print(f"{metric}: {value:.2%}")
+
+# Plot cumulative returns
+plt.figure(figsize=(12, 6))
+cum_returns = (1 + strategy_returns).cumprod()
+plt.plot(cum_returns.index, cum_returns.values)
+plt.title('Cumulative Strategy Returns (including commissions)')
+plt.xlabel('Date')
+plt.ylabel('Cumulative Return')
+plt.grid(True)
+plt.show()
